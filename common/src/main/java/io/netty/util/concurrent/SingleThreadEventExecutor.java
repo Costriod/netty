@@ -281,10 +281,12 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         }
         long nanoTime = AbstractScheduledEventExecutor.nanoTime();
         for (;;) {
+            //从定时队列中取出任务
             Runnable scheduledTask = pollScheduledTask(nanoTime);
             if (scheduledTask == null) {
                 return true;
             }
+            //将任务加入到taskQueue，如果taskQueue满了，则重新将任务还原到scheduledTaskQueue
             if (!taskQueue.offer(scheduledTask)) {
                 // No space left in the task queue add it back to the scheduledTaskQueue so we pick it up again.
                 scheduledTaskQueue.add((ScheduledFutureTask<?>) scheduledTask);
@@ -456,9 +458,15 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     /**
      * Poll all tasks from the task queue and run them via {@link Runnable#run()} method.  This method stops running
      * the tasks in the task queue and returns if it ran longer than {@code timeoutNanos}.
+     *
+     * 不断执行任务队列的任务，如果执行任务的总时间达到timeoutNanos，则立即结束，等待下一轮循环
+     * @param timeoutNanos 执行任务的总时间
      */
     protected boolean runAllTasks(long timeoutNanos) {
+        //从scheduledTaskQueue取出任务，放到taskQueue，如果为null则忽略
         fetchFromScheduledTaskQueue();
+
+        //取出第一个任务
         Runnable task = pollTask();
         if (task == null) {
             afterRunningAllTasks();
@@ -743,6 +751,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     }
 
     /**
+     * 在shutdown期间，执行taskQueue剩余的所有任务
      * Confirm that the shutdown if the instance should be done now!
      */
     protected boolean confirmShutdown() {
@@ -812,6 +821,12 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         return isTerminated();
     }
 
+    /**
+     * 注意：channel.eventLoop().execute(new Runnable() {...}) 本质上是执行这个方法
+     *
+     * 1.首先将task添加到队列
+     * @param task
+     */
     @Override
     public void execute(Runnable task) {
         ObjectUtil.checkNotNull(task, "task");
@@ -823,7 +838,14 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         execute(ObjectUtil.checkNotNull(task, "task"), false);
     }
 
+    /**
+     * 1.如果是第一次execute，则会启动一个新的thread，然后将新的thread注册到当前NioEventLoop，最后启动NioEventLoop的run()方法【这个run()方法本质上是一个无限循环，处理各种select事件、以及taskQueue的任务】
+     * 2.如果是第二次以后execute，则不会启动新的thread，只会将task加入到taskQueue，等待前面NioEventLoop的run()处理taskQueue的任务
+     * @param task
+     * @param immediate
+     */
     private void execute(Runnable task, boolean immediate) {
+        //判断当前Thread与 NioEventLoop的thread是否是同一个
         boolean inEventLoop = inEventLoop();
         addTask(task);
         if (!inEventLoop) {
@@ -939,6 +961,9 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     private static final long SCHEDULE_PURGE_INTERVAL = TimeUnit.SECONDS.toNanos(1);
 
+    /**
+     * 启动NioEventLoop的run()方法
+     */
     private void startThread() {
         if (state == ST_NOT_STARTED) {
             if (STATE_UPDATER.compareAndSet(this, ST_NOT_STARTED, ST_STARTED)) {
@@ -975,9 +1000,11 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     private void doStartThread() {
         assert thread == null;
+        //执行ThreadPerTaskExecutor的execute方法，创建一个新的thread
         executor.execute(new Runnable() {
             @Override
             public void run() {
+                //新创建的thread
                 thread = Thread.currentThread();
                 if (interrupted) {
                     thread.interrupt();
@@ -986,11 +1013,18 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                 boolean success = false;
                 updateLastExecutionTime();
                 try {
+                    //SingleThreadEventExecutor的run()方法是一个抽象方法，底层实际上是执行NioEventLoop的run()方法
+                    //而NioEventLoop的run()方法本质上是一个无限循环，所以执行到这里就不会执行下去了，除非NioEventLoop的
+                    //run()方法抛异常，或者EventLoopGroup正常shutdown
                     SingleThreadEventExecutor.this.run();
+
+                    //只有当EventLoopGroup正常shutdown才会执行到这里
                     success = true;
                 } catch (Throwable t) {
                     logger.warn("Unexpected exception from an event executor: ", t);
                 } finally {
+                    //因为执行到这里只有两种可能，要么是NioEventLoop的run()方法抛异常
+                    //或者是EventLoopGroup正常shutdown
                     for (;;) {
                         int oldState = state;
                         if (oldState >= ST_SHUTTING_DOWN || STATE_UPDATER.compareAndSet(
@@ -1013,6 +1047,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                         // is in ST_SHUTTING_DOWN state still accepting tasks which is needed for
                         // graceful shutdown with quietPeriod.
                         for (;;) {
+                            //在shutdown期间，执行taskQueue剩余的所有任务
                             if (confirmShutdown()) {
                                 break;
                             }
@@ -1033,6 +1068,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                         confirmShutdown();
                     } finally {
                         try {
+                            //清理操作，NioEventLoop执行selector.close()
                             cleanup();
                         } finally {
                             // Lets remove all FastThreadLocals for the Thread as we are about to terminate and notify

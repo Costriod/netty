@@ -29,6 +29,7 @@ import io.netty.channel.internal.ChannelUtils;
 import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.channel.socket.SocketChannelConfig;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.internal.StringUtil;
 
 import java.io.IOException;
@@ -131,6 +132,10 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
             }
         }
 
+        /**
+         * 当server收到OP_READ事件，会执行到这里
+         * 注意：如果是client关闭了connection，server端也会收到OP_READ事件，执行到这里的时候读取的byte数量就是0
+         */
         @Override
         public final void read() {
             final ChannelConfig config = config();
@@ -149,6 +154,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                 do {
                     byteBuf = allocHandle.allocate(allocator);
                     allocHandle.lastBytesRead(doReadBytes(byteBuf));
+                    //当读取到的字节数为0，说明是client端发起了关闭channel操作
                     if (allocHandle.lastBytesRead() <= 0) {
                         // nothing was read. release the buffer.
                         byteBuf.release();

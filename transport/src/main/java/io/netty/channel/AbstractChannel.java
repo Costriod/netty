@@ -16,10 +16,16 @@
 package io.netty.channel;
 
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.channel.nio.AbstractNioChannel;
+import io.netty.channel.nio.AbstractNioMessageChannel;
+import io.netty.channel.nio.NioEventLoop;
 import io.netty.channel.socket.ChannelOutputShutdownEvent;
 import io.netty.channel.socket.ChannelOutputShutdownException;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.DefaultAttributeMap;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.SingleThreadEventExecutor;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.UnstableApi;
@@ -34,6 +40,8 @@ import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.NotYetConnectedException;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 
@@ -243,6 +251,14 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         return this;
     }
 
+    /**
+     * {@link NioServerSocketChannel}监听端口，通过pipeline进行bind操作，从pipeline的tail往head进行bind，
+     * 仅限pipeline中的{@link ChannelOutboundHandler}才会执行bind
+     *
+     * @param localAddress
+     * @param promise
+     * @return
+     */
     @Override
     public ChannelFuture bind(SocketAddress localAddress, ChannelPromise promise) {
         return pipeline.bind(localAddress, promise);
@@ -273,6 +289,12 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         return pipeline.deregister(promise);
     }
 
+    /**
+     * pipeline的read操作是从tail到head逆序read
+     * 1.如果是{@link NioServerSocketChannel}，则read的是{@link NioSocketChannel}
+     * 2.如果是{@link NioSocketChannel}，则read的是网络报文
+     * @return
+     */
     @Override
     public Channel read() {
         pipeline.read();
@@ -331,6 +353,9 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
     /**
      * Create a new {@link AbstractUnsafe} instance which will be used for the life-time of the {@link Channel}
+     *
+     * 对于 {@link NioServerSocketChannel} 则创建的AbstractUnsafe是{@link AbstractNioMessageChannel.NioMessageUnsafe}
+     *
      */
     protected abstract AbstractUnsafe newUnsafe();
 
@@ -449,9 +474,20 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             return remoteAddress0();
         }
 
+        /**
+         * 1.如果是 {@link AbstractNioMessageChannel.NioMessageUnsafe} 执行register，代表server端建立端口监听的时候，
+         * 此时eventLoop是{@link NioEventLoop}  promise是{@link DefaultChannelPromise}
+         *
+         *
+         * 注意：eventLoop().execute(new Runnable() {...}) 本质上是执行{@link SingleThreadEventExecutor#execute(java.lang.Runnable)}
+         *
+         * @param eventLoop
+         * @param promise
+         */
         @Override
         public final void register(EventLoop eventLoop, final ChannelPromise promise) {
             ObjectUtil.checkNotNull(eventLoop, "eventLoop");
+            //NioServerSocketChannel只能register一次
             if (isRegistered()) {
                 promise.setFailure(new IllegalStateException("registered to an event loop already"));
                 return;
@@ -464,10 +500,12 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
             AbstractChannel.this.eventLoop = eventLoop;
 
+            //第一次register的时候，NioEventLoop的thread还是null，此时eventLoop.inEventLoop()返回的是false
             if (eventLoop.inEventLoop()) {
                 register0(promise);
             } else {
                 try {
+                    //第一次register的时候，进入这里，创建新的thread，然后把thread绑定到NioEventLoop
                     eventLoop.execute(new Runnable() {
                         @Override
                         public void run() {
@@ -485,6 +523,17 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
         }
 
+        /**
+         * 注意：doRegister()是一个抽象方法，子类有不同实现
+         *
+         * 1.先执行register操作
+         * 2.pipeline内部的所有handler执行handlerAdded(ctx)方法
+         * 3.执行pipeline内部的ChannelInboundHandler.channelRegistered(ctx)
+         * 4.如果channel是active状态，并且是第一次register，那么立即触发一个ChannelActive事件，然后执行pipeline内部的ChannelInboundHandler.channelActive(ctx)
+         * 如果channel已经register完毕，则开始进行读取网络报文
+         *
+         * @param promise {@link DefaultChannelPromise}对象
+         */
         private void register0(ChannelPromise promise) {
             try {
                 // check if the channel is still open as it could be closed in the mean time when the register
@@ -493,20 +542,31 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                     return;
                 }
                 boolean firstRegistration = neverRegistered;
+                //执行register操作
                 doRegister();
                 neverRegistered = false;
                 registered = true;
 
                 // Ensure we call handlerAdded(...) before we actually notify the promise. This is needed as the
                 // user may already fire events through the pipeline in the ChannelFutureListener.
+                // 这一步比较简单，其实就是执行当前pipeline绑定的handler.handlerAdded(ctx)方法
+                // 一般都是pipeline.addLast(new ChannelInitializer<Channel>() ...)绑定的ChannelInitializer
+                //
+                // handler.handlerAdded(ctx)方法执行的时候，会触发ChannelInitializer.initChannel(Channel)操作，需要注意
                 pipeline.invokeHandlerAddedIfNeeded();
 
                 safeSetSuccess(promise);
+
+                // 遍历pipeline的HandlerContext，每个context内部都有一个handler，从head遍历到tail，
+                // 如果context.handler属于ChannelInboundHandler，则触发ChannelInboundHandler.channelRegistered(ctx)
                 pipeline.fireChannelRegistered();
                 // Only fire a channelActive if the channel has never been registered. This prevents firing
                 // multiple channel actives if the channel is deregistered and re-registered.
+                //当NioServerSocketChannel端进行register的时候，active为false，不会进入这里
                 if (isActive()) {
+                    //当NioSocketChannel端进行register的时候，active为true，会进入这里
                     if (firstRegistration) {
+                        //NioSocketChannel第一次register，那么立即触发一个ChannelActive事件，然后执行pipeline内部的ChannelInboundHandler.channelActive(ctx)
                         pipeline.fireChannelActive();
                     } else if (config().isAutoRead()) {
                         // This channel was registered before and autoRead() is set. This means we need to begin read
@@ -524,6 +584,13 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
         }
 
+        /**
+         * pipeline的head.bind最终进入的是这里
+         * 1.先执行{@link NioServerSocketChannel#doBind(java.net.SocketAddress)}建立端口，监听外部tcp连接以及网络报文
+         * 2.然后触发pipeline.fireChannelActive()
+         * @param localAddress
+         * @param promise
+         */
         @Override
         public final void bind(final SocketAddress localAddress, final ChannelPromise promise) {
             assertEventLoop();
@@ -545,8 +612,10 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                         "address (" + localAddress + ") anyway as requested.");
             }
 
+            //最开始isActive()是false
             boolean wasActive = isActive();
             try {
+                //执行doBind
                 doBind(localAddress);
             } catch (Throwable t) {
                 safeSetFailure(promise, t);
@@ -832,6 +901,15 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             });
         }
 
+        /**
+         * 其实这个beginRead就是做一件事，就是通过selectionKey.interestOps(ops)给SocketChannel注册感兴趣的事件类型，
+         * 然后让{@link NioEventLoop#run()}方法内部无限循环执行{@link Selector#select()}读取就绪事件，然后处理
+         *
+         * 1.对于{@link NioServerSocketChannel}感兴趣的事件类型是{@link SelectionKey#OP_ACCEPT} (OP_ACCEPT值为16)
+         * 2.对于{@link NioSocketChannel}感兴趣的是{@link SelectionKey#OP_READ} (OP_READ值为1)
+         *
+         * 而doBeginRead方法在 {@link AbstractNioChannel#doBeginRead()}里面
+         */
         @Override
         public final void beginRead() {
             assertEventLoop();

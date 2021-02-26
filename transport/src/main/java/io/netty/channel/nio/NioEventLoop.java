@@ -22,6 +22,8 @@ import io.netty.channel.EventLoopException;
 import io.netty.channel.EventLoopTaskQueueFactory;
 import io.netty.channel.SelectStrategy;
 import io.netty.channel.SingleThreadEventLoop;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.IntSupplier;
 import io.netty.util.concurrent.RejectedExecutionHandler;
 import io.netty.util.internal.ObjectUtil;
@@ -110,9 +112,18 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     /**
      * The NIO {@link Selector}.
+     * 1.一般在linux kernel 2.6之前采用普通的selector，linux kernel 2.6以后采用epoll selector
+     * 2.在unix一般是kqueue selector
      */
     private Selector selector;
+    /**
+     * 和上面的selector本质上底层都是同一个对象
+     */
     private Selector unwrappedSelector;
+    /**
+     * 主要用于存储java NIO SelectionKey，每个NioEventLoop都会绑定很多个Channel，每个Channel都有一个SelectionKey
+     * SelectionKey用于channel注册感兴趣的事件
+     */
     private SelectedSelectionKeySet selectedKeys;
 
     private final SelectorProvider provider;
@@ -128,6 +139,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     private final SelectStrategy selectStrategy;
 
+    /**
+     * 处理channel的IO任务时间百分比
+     */
     private volatile int ioRatio = 50;
     private int cancelledKeys;
     private boolean needsToSelectAgain;
@@ -170,6 +184,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     private SelectorTuple openSelector() {
         final Selector unwrappedSelector;
         try {
+            //通过底层的provider.openSelector()返回一个Selector对象，不同的os有不同的实现，但在应用层已经屏蔽了底层复杂性
             unwrappedSelector = provider.openSelector();
         } catch (IOException e) {
             throw new ChannelException("failed to open a new selector", e);
@@ -206,6 +221,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         final Class<?> selectorImplClass = (Class<?>) maybeSelectorImplClass;
         final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
 
+        //通过反射机制将selectedKeySet注册到selector里面，每次selector.select()执行之后，只要有就绪事件，则后面可以遍历selectedKeySet处理
         Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
             @Override
             public Object run() {
@@ -213,6 +229,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                     Field selectedKeysField = selectorImplClass.getDeclaredField("selectedKeys");
                     Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
 
+                    //通过反射机制将selectedKeySet注册到selector里面
                     if (PlatformDependent.javaVersion() >= 9 && PlatformDependent.hasUnsafe()) {
                         // Let us try to use sun.misc.Unsafe to replace the SelectionKeySet.
                         // This allows us to also do this in Java9+ without any extra flags.
@@ -230,6 +247,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                         // We could not retrieve the offset, lets try reflection as last-resort.
                     }
 
+                    //通过反射机制将selectedKeySet注册到selector里面
                     Throwable cause = ReflectionUtil.trySetAccessible(selectedKeysField, true);
                     if (cause != null) {
                         return cause;
@@ -350,6 +368,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     /**
      * Replaces the current {@link Selector} of this event loop with newly created {@link Selector}s to work
      * around the infamous epoll 100% CPU bug.
+     *
+     * 处理event loop空轮询cpu 100%的bug，其实就是创建一个新的Selector，然后把旧的SelectionKey迁移到新的Selector
      */
     public void rebuildSelector() {
         if (!inEventLoop()) {
@@ -369,6 +389,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         return selector.keys().size() - cancelledKeys;
     }
 
+    /**
+     * 处理event loop空轮询cpu 100%的bug，其实就是创建一个新的Selector，然后把旧的SelectionKey迁移到新的Selector
+     */
     private void rebuildSelector0() {
         final Selector oldSelector = selector;
         final SelectorTuple newSelectorTuple;
@@ -431,6 +454,11 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    /**
+     * 这个run方法主要做3个动作
+     * 1.首先执行selector.select()，获取就绪 IO 事件
+     * 2.处理上面
+     */
     @Override
     protected void run() {
         int selectCnt = 0;
@@ -454,6 +482,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                         nextWakeupNanos.set(curDeadlineNanos);
                         try {
                             if (!hasTasks()) {
+                                //如果select之后，ServerSocketChannel有就绪事件，则返回的strategy > 0
                                 strategy = select(curDeadlineNanos);
                             }
                         } finally {
@@ -478,26 +507,35 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                 needsToSelectAgain = false;
                 final int ioRatio = this.ioRatio;
                 boolean ranTasks;
+
+                //如果ioRatio=100，代表EventLoop的所有时间用于处理网络io事件
                 if (ioRatio == 100) {
                     try {
+                        //如果有io就绪事件，则处理网路io
                         if (strategy > 0) {
                             processSelectedKeys();
                         }
                     } finally {
                         // Ensure we always run tasks.
+                        // 不管前面有没有网络io就绪事件，最后都要将任务队列剩余任务执行掉，不然就白白浪费了当前线程的CPU资源
                         ranTasks = runAllTasks();
                     }
                 } else if (strategy > 0) {
+                    //如果ioRatio不等于100，并且有io就绪事件
                     final long ioStartTime = System.nanoTime();
                     try {
+                        //处理网络io就绪事件
                         processSelectedKeys();
                     } finally {
                         // Ensure we always run tasks.
                         final long ioTime = System.nanoTime() - ioStartTime;
+                        //根据ioRatio的分配比例，分配执行时间
                         ranTasks = runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                     }
                 } else {
-                    ranTasks = runAllTasks(0); // This will run the minimum number of tasks
+                    // This will run the minimum number of tasks
+                    // 最多执行一个任务
+                    ranTasks = runAllTasks(0);
                 }
 
                 if (ranTasks || strategy > 0) {
@@ -651,6 +689,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
             final Object a = k.attachment();
 
+            //如果attachment是NioServerSocketChannel，则代表是server端，读取的是AbstractNioChannel
             if (a instanceof AbstractNioChannel) {
                 processSelectedKey(k, (AbstractNioChannel) a);
             } else {
@@ -670,6 +709,25 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    /**
+     * 以下两种代表{@link NioServerSocketChannel}，ch.unsafe()是一个{@link AbstractNioMessageChannel.NioMessageUnsafe}
+     * 1.{@link SelectionKey#OP_ACCEPT} 表示服务器监听到了客户连接，服务器可以接收这个连接了
+     *
+     * 以下两种代表{@link NioSocketChannel}，ch.unsafe()是一个{@link NioSocketChannel.NioSocketChannelUnsafe}
+     * 2.{@link SelectionKey#OP_CONNECT} 表示客户与服务器的连接已经建立成功
+     * 3.{@link SelectionKey#OP_READ} 表示通道中已经有了可读的数据，可以执行读操作了
+     * 4.{@link SelectionKey#OP_WRITE} 表示已经可以向通道写数据了
+     *
+     * 一个server-client架构，事件触发顺序为：
+     * （1）首先client先发起连接操作，所以在client端先触发{@link SelectionKey#OP_CONNECT}
+     * （2）然后server端触发{@link SelectionKey#OP_ACCEPT}，代表server监听到了client的连接
+     * （3）server处理完{@link SelectionKey#OP_ACCEPT}之后，会通过unsafe.read()读取到一个{@link NioSocketChannel}，
+     * 然后将这个{@link NioSocketChannel}绑定到childGroup里面，让childGroup的线程处理
+     * （4）childGroup线程处理{@link NioSocketChannel}的{@link SelectionKey#OP_READ} 或 {@link SelectionKey#OP_WRITE}事件
+     *
+     * @param k
+     * @param ch
+     */
     private void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {
         final AbstractNioChannel.NioUnsafe unsafe = ch.unsafe();
         if (!k.isValid()) {
@@ -697,6 +755,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             int readyOps = k.readyOps();
             // We first need to call finishConnect() before try to trigger a read(...) or write(...) as otherwise
             // the NIO JDK channel implementation may throw a NotYetConnectedException.
+
+            //第一步：client端发起连接，此时client端会触发OP_CONNECT事件
             if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
                 // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking
                 // See https://github.com/netty/netty/issues/924
@@ -708,6 +768,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             }
 
             // Process OP_WRITE first as we may be able to write some queued buffers and so free memory.
+            //第四步：（Server或client）注册SelectionKey.OP_WRITE，等到channel.isWritable()触发写事件，则会进入这里来
             if ((readyOps & SelectionKey.OP_WRITE) != 0) {
                 // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write
                 ch.unsafe().forceFlush();
@@ -715,6 +776,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
             // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
             // to a spin loop
+            //第二步：server端会触发OP_ACCEPT事件，此时unsafe是NioMessageUnsafe，执行unsafe.read()读取一个NioSocketChannel，最后交给childGroup的线程处理
+            //第三步：（Server或client）收到数据触发OP_READ事件，此时unsafe是NioSocketChannelUnsafe，然后unsafe.read()读取的是一个ByteBuf
             if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
                 unsafe.read();
             }

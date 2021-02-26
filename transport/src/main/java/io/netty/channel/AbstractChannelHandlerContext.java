@@ -161,8 +161,10 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
     }
 
     private void invokeChannelRegistered() {
+        //前面执行handler.handlerAdded(ctx)已经把handlerState设为ADD_COMPLETE
         if (invokeHandler()) {
             try {
+                //触发channelRegistered
                 ((ChannelInboundHandler) handler()).channelRegistered(this);
             } catch (Throwable t) {
                 invokeExceptionCaught(t);
@@ -500,6 +502,14 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
         return promise;
     }
 
+    /**
+     * 递归操作，从tail往head逆序遍历ChannelOutboundHandler，执行ChannelOutboundHandler.bind(socketAddress, promise)操作
+     * 因为head是{@link DefaultChannelPipeline.HeadContext}对象，所以head也是一个ChannelOutboundHandler，最后会执行到
+     * {@link DefaultChannelPipeline.HeadContext#bind(ChannelHandlerContext, SocketAddress, ChannelPromise)}
+     *
+     * @param localAddress
+     * @param promise
+     */
     private void invokeBind(SocketAddress localAddress, ChannelPromise promise) {
         if (invokeHandler()) {
             try {
@@ -508,6 +518,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 notifyOutboundHandlerException(t, promise);
             }
         } else {
+            //递归操作，从tail往head逆序遍历ChannelOutboundHandler，执行ChannelOutboundHandler.bind(socketAddress, promise)操作
             bind(localAddress, promise);
         }
     }
@@ -878,6 +889,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
         EventExecutor currentExecutor = executor();
         do {
             ctx = ctx.next;
+            //旧版本的netty是while (!ctx.inbound)，判断ctx是否是inbound，如果不是inbound则继续循环，ctx切换到next
         } while (skipContext(ctx, currentExecutor, mask, MASK_ONLY_INBOUND));
         return ctx;
     }
@@ -887,6 +899,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
         EventExecutor currentExecutor = executor();
         do {
             ctx = ctx.prev;
+            //旧版本的netty是while (!ctx.outbound)，判断ctx是否是outbound，如果不是outbound则继续循环，ctx切换到next
         } while (skipContext(ctx, currentExecutor, mask, MASK_ONLY_OUTBOUND));
         return ctx;
     }

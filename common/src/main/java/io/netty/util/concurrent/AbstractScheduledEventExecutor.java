@@ -126,11 +126,15 @@ public abstract class AbstractScheduledEventExecutor extends AbstractEventExecut
     protected final Runnable pollScheduledTask(long nanoTime) {
         assert inEventLoop();
 
+        //peek操作不会从scheduledTaskQueue删除任务，仅仅是获取第一个任务（任务依旧是在scheduledTaskQueue里面）
         ScheduledFutureTask<?> scheduledTask = peekScheduledTask();
+        //如果任务需要执行的时间大于nanoTime，说明还没到这个定时任务的执行时间
         if (scheduledTask == null || scheduledTask.deadlineNanos() - nanoTime > 0) {
             return null;
         }
+        //如果到了这个任务的执行时间，则立即从scheduledTaskQueue移除
         scheduledTaskQueue.remove();
+        //标记这个任务已经被消费
         scheduledTask.setConsumed();
         return scheduledTask;
     }

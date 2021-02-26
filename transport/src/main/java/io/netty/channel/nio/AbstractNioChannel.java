@@ -27,6 +27,8 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.EventLoop;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.internal.logging.InternalLogger;
@@ -81,6 +83,7 @@ public abstract class AbstractNioChannel extends AbstractChannel {
         this.ch = ch;
         this.readInterestOp = readInterestOp;
         try {
+            //设置为非阻塞IO
             ch.configureBlocking(false);
         } catch (IOException e) {
             try {
@@ -372,11 +375,19 @@ public abstract class AbstractNioChannel extends AbstractChannel {
         return loop instanceof NioEventLoop;
     }
 
+    /**
+     * SocketChannel执行register
+     * 注意：这里register的interestOp是0，此时SocketChannel是无法 selector.select() 到任何事件的，
+     * 必须等下面{@link AbstractNioChannel#doBeginRead()} 设置interestOp之后，selector.select()才能获得就绪的事件
+     *
+     * @throws Exception
+     */
     @Override
     protected void doRegister() throws Exception {
         boolean selected = false;
         for (;;) {
             try {
+                //SocketChannel执行register interestOp为0
                 selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this);
                 return;
             } catch (CancelledKeyException e) {
@@ -399,6 +410,16 @@ public abstract class AbstractNioChannel extends AbstractChannel {
         eventLoop().cancel(selectionKey());
     }
 
+    /**
+     * 上面doRegister()执行完毕之后，会触发pipeline.channelActive(ctx)，此时在head这里也会触发read()操作，然后read操作会进入下面这里，
+     *
+     * 1.对于{@link NioServerSocketChannel}，下面selectionKey设置了interestOp为 {@link SelectionKey#OP_ACCEPT}
+     * 2.对于{@link NioSocketChannel}，下面selectionKey设置了interestOp为 {@link SelectionKey#OP_READ}
+     *
+     * 只有执行了下面的 doBeginRead() 才代表 SocketChannel 能够通过selector.select()获取到关注的事件
+     *
+     * @throws Exception
+     */
     @Override
     protected void doBeginRead() throws Exception {
         // Channel.read() or ChannelHandlerContext.read() was called

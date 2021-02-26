@@ -33,8 +33,10 @@ public final class DefaultEventExecutorChooserFactory implements EventExecutorCh
     @Override
     public EventExecutorChooser newChooser(EventExecutor[] executors) {
         if (isPowerOfTwo(executors.length)) {
+            //如果容量是2的指数倍，则采用二进制 & 运算，二进制 & 运算效率比取模效率高
             return new PowerOfTwoEventExecutorChooser(executors);
         } else {
+            //否则采用普通的 % 取模运算
             return new GenericEventExecutorChooser(executors);
         }
     }

@@ -27,6 +27,7 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ServerChannel;
+import io.netty.channel.nio.AbstractNioMessageChannel;
 import io.netty.util.AttributeKey;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -48,10 +49,19 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
 
     // The order in which child ChannelOptions are applied is important they may depend on each other for validation
     // purposes.
+    /**
+     * option主要是针对parentGroup线程组，childOptions主要是针对childGroup线程组
+     */
     private final Map<ChannelOption<?>, Object> childOptions = new LinkedHashMap<ChannelOption<?>, Object>();
     private final Map<AttributeKey<?>, Object> childAttrs = new ConcurrentHashMap<AttributeKey<?>, Object>();
     private final ServerBootstrapConfig config = new ServerBootstrapConfig(this);
+    /**
+     * 主要处理客户端tcp channel的网络io
+     */
     private volatile EventLoopGroup childGroup;
+    /**
+     * handler在初始化时就会执行，而childHandler会在客户端成功connect后才执行，这是两者的区别
+     */
     private volatile ChannelHandler childHandler;
 
     public ServerBootstrap() { }
@@ -68,6 +78,9 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
 
     /**
      * Specify the {@link EventLoopGroup} which is used for the parent (acceptor) and the child (client).
+     *
+     * 如果指定一个EventLoopGroup，那么就在这个EventLoopGroup上面处理所有tcp连接事件和网络io事件
+     *
      */
     @Override
     public ServerBootstrap group(EventLoopGroup group) {
@@ -78,6 +91,11 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
      * Set the {@link EventLoopGroup} for the parent (acceptor) and the child (client). These
      * {@link EventLoopGroup}'s are used to handle all the events and IO for {@link ServerChannel} and
      * {@link Channel}'s.
+     *
+     * 绑定parentGroup和childGroup
+     *
+     * parentGroup主要负责处理tcp channel连接事件
+     * childGroup主要负责处理tcp channel的网络io事件（例如读写tcp报文）
      */
     public ServerBootstrap group(EventLoopGroup parentGroup, EventLoopGroup childGroup) {
         super.group(parentGroup);
@@ -89,6 +107,10 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
     }
 
     /**
+     * 设置childOption，如果value为null则代表remove这个childOption
+     *
+     * option主要是针对parentGroup线程组，childOptions主要是针对childGroup线程组
+     *
      * Allow to specify a {@link ChannelOption} which is used for the {@link Channel} instances once they get created
      * (after the acceptor accepted the {@link Channel}). Use a value of {@code null} to remove a previous set
      * {@link ChannelOption}.
@@ -106,6 +128,8 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
     }
 
     /**
+     * 设置childAttr，如果value为null则代表remove这个childAttr
+     *
      * Set the specific {@link AttributeKey} with the given value on every child {@link Channel}. If the value is
      * {@code null} the {@link AttributeKey} is removed
      */
@@ -120,6 +144,7 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
     }
 
     /**
+     * 设置childHandler
      * Set the {@link ChannelHandler} which is used to serve the request for the {@link Channel}'s.
      */
     public ServerBootstrap childHandler(ChannelHandler childHandler) {
@@ -127,11 +152,18 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         return this;
     }
 
+    /**
+     * 初始化ServerSocketChannel，由父类AbstractBootstrap执行initAndRegister()的时候进入这里
+     *
+     *
+     * @param channel
+     */
     @Override
     void init(Channel channel) {
         setChannelOptions(channel, newOptionsArray(), logger);
         setAttributes(channel, attrs0().entrySet().toArray(EMPTY_ATTRIBUTE_ARRAY));
 
+        //NioServerSocketChannel的pipeline是一个DefaultChannelPipeline，此时只有一个head和tail
         ChannelPipeline p = channel.pipeline();
 
         final EventLoopGroup currentChildGroup = childGroup;
@@ -142,18 +174,23 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         }
         final Entry<AttributeKey<?>, Object>[] currentChildAttrs = childAttrs.entrySet().toArray(EMPTY_ATTRIBUTE_ARRAY);
 
+        //注意这里这个ChannelInitializer，initChannel不会现在立即执行，而是在AbstractUnsafe的register0方法中执行
         p.addLast(new ChannelInitializer<Channel>() {
             @Override
             public void initChannel(final Channel ch) {
+                //这里这个ch就是NioServerSocketChannel
                 final ChannelPipeline pipeline = ch.pipeline();
+                //这个handler就是在ServerBootstrap.handler(ChannelHandler handler)注册的
                 ChannelHandler handler = config.handler();
                 if (handler != null) {
                     pipeline.addLast(handler);
                 }
 
+                //本质上执行NioEventLoop的execute方法
                 ch.eventLoop().execute(new Runnable() {
                     @Override
                     public void run() {
+                        //pipeline添加一个ServerBootstrapAcceptor
                         pipeline.addLast(new ServerBootstrapAcceptor(
                                 ch, currentChildGroup, currentChildHandler, currentChildOptions, currentChildAttrs));
                     }
@@ -162,6 +199,10 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         });
     }
 
+    /**
+     * 检查各个属性是否配置完毕
+     * @return
+     */
     @Override
     public ServerBootstrap validate() {
         super.validate();
@@ -183,6 +224,13 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         private final Entry<AttributeKey<?>, Object>[] childAttrs;
         private final Runnable enableAutoReadTask;
 
+        /**
+         * @param channel 其实就是NioServerSocketChannel
+         * @param childGroup
+         * @param childHandler
+         * @param childOptions
+         * @param childAttrs
+         */
         ServerBootstrapAcceptor(
                 final Channel channel, EventLoopGroup childGroup, ChannelHandler childHandler,
                 Entry<ChannelOption<?>, Object>[] childOptions, Entry<AttributeKey<?>, Object>[] childAttrs) {
@@ -199,22 +247,34 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
             enableAutoReadTask = new Runnable() {
                 @Override
                 public void run() {
+                    //设置autoRead=true
                     channel.config().setAutoRead(true);
                 }
             };
         }
 
+        /**
+         * 当NioServerSocketChannel读取到外部tcp连接的时候，会触发channelRead，其实读到的msg就是一个NioSocketChannel；
+         * 是在{@link AbstractNioMessageChannel.NioMessageUnsafe#read()}方法触发channelRead，然后进入这里的
+         *
+         * 读取到外部tcp连接的时候，将NioSocketChannel注册到childGroup的某个EventLoop中
+         * @param ctx
+         * @param msg
+         */
         @Override
         @SuppressWarnings("unchecked")
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             final Channel child = (Channel) msg;
 
+            //读取到client的NioSocketChannel之后，立即往NioSocketChannel的pipeline中注册childHandler
+            //childHandler就是ServerBootstrap.childHandler(new ChannelInitializer() {...})这里面注册的ChannelInitializer
             child.pipeline().addLast(childHandler);
 
             setChannelOptions(child, childOptions, logger);
             setAttributes(child, childAttrs);
 
             try {
+                //将当前读取到的NioSocketChannel注册到childGroup的某个EventLoop中
                 childGroup.register(child).addListener(new ChannelFutureListener() {
                     @Override
                     public void operationComplete(ChannelFuture future) throws Exception {

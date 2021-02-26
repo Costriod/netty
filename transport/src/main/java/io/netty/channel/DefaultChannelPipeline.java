@@ -16,6 +16,9 @@
 package io.netty.channel;
 
 import io.netty.channel.Channel.Unsafe;
+import io.netty.channel.nio.AbstractNioMessageChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ResourceLeakDetector;
 import io.netty.util.concurrent.EventExecutor;
@@ -89,6 +92,10 @@ public class DefaultChannelPipeline implements ChannelPipeline {
      */
     private boolean registered;
 
+    /**
+     * 创建一个Pipeline，初始化一个HeadContext和TailContext
+     * @param channel
+     */
     protected DefaultChannelPipeline(Channel channel) {
         this.channel = ObjectUtil.checkNotNull(channel, "channel");
         succeededFuture = new SucceededChannelFuture(channel, null);
@@ -890,6 +897,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         }
     }
 
+    /**
+     * 需要注意：pipeline的head是HeadContext类型，在触发channelActive事件之后，会立即执行read操作
+     * 对于NioServerSocketChannel，read操作主要是读取 NioSocketChannel
+     * 对于NioSocketChannel，read操作主要是读取网络报文
+     * @return
+     */
     @Override
     public final ChannelPipeline fireChannelActive() {
         AbstractChannelHandlerContext.invokeChannelActive(head);
@@ -920,6 +933,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         return this;
     }
 
+    /**
+     * 需要注意：pipeline的head是HeadContext类型，在触发channelReadComplete事件之后，会立即执行read操作
+     * 对于NioServerSocketChannel，read操作主要是读取 NioSocketChannel
+     * 对于NioSocketChannel，read操作主要是读取网络报文
+     * @return
+     */
     @Override
     public final ChannelPipeline fireChannelReadComplete() {
         AbstractChannelHandlerContext.invokeChannelReadComplete(head);
@@ -968,6 +987,13 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         return this;
     }
 
+    /**
+     * 从pipeline的tail往head进行bind
+     *
+     * @param localAddress
+     * @param promise
+     * @return
+     */
     @Override
     public final ChannelFuture bind(SocketAddress localAddress, ChannelPromise promise) {
         return tail.bind(localAddress, promise);
@@ -999,6 +1025,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         return tail.deregister(promise);
     }
 
+    /**
+     * pipeline的read操作是从tail到head逆序read，只有pipeline中的{@link ChannelOutboundHandler}才会执行read
+     * 刚好head是{@link HeadContext}，本身也是一个{@link ChannelOutboundHandler}，
+     * 所以会执行到{@link HeadContext#read(ChannelHandlerContext)}
+     * @return
+     */
     @Override
     public final ChannelPipeline read() {
         tail.read();
@@ -1102,6 +1134,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             // This Channel itself was registered.
             registered = true;
 
+            //pendingHandlerCallbackHead 本身在pipeline.addLast(handler)的时候就会初始化，默认是PendingHandlerAddedTask对象
             pendingHandlerCallbackHead = this.pendingHandlerCallbackHead;
             // Null out so it can be GC'ed.
             this.pendingHandlerCallbackHead = null;
@@ -1110,6 +1143,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         // This must happen outside of the synchronized(...) block as otherwise handlerAdded(...) may be called while
         // holding the lock and so produce a deadlock if handlerAdded(...) will try to add another handler from outside
         // the EventLoop.
+        // 默认是PendingHandlerAddedTask对象，维持了一个链表结构
         PendingHandlerCallback task = pendingHandlerCallbackHead;
         while (task != null) {
             task.execute();
@@ -1328,9 +1362,20 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             // NOOP
         }
 
+        /**
+         * 对于{@link NioServerSocketChannel}进行bind操作，在这里建立端口监听，此时head.unsafe是一个
+         * {@link AbstractNioMessageChannel.NioMessageUnsafe}对象
+         *
+         * unsafe.bind方法是在{@link AbstractChannel.AbstractUnsafe#bind(java.net.SocketAddress, io.netty.channel.ChannelPromise)}
+         *
+         * @param ctx           the {@link ChannelHandlerContext} for which the bind operation is made
+         * @param localAddress  the {@link SocketAddress} to which it should bound
+         * @param promise       the {@link ChannelPromise} to notify once the operation completes
+         */
         @Override
         public void bind(
                 ChannelHandlerContext ctx, SocketAddress localAddress, ChannelPromise promise) {
+            //这里的unsafe是NioMessageUnsafe类型
             unsafe.bind(localAddress, promise);
         }
 
@@ -1357,6 +1402,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             unsafe.deregister(promise);
         }
 
+        /**
+         * 1.如果是{@link NioServerSocketChannel}，unsafe是一个{@link AbstractNioMessageChannel.NioMessageUnsafe}对象
+         * unsafe.beginRead()执行的是让NioServerSocketChannel.register()
+         * 2.如果是{@link NioSocketChannel}，unsafe是一个{@link NioSocketChannel.NioSocketChannelUnsafe}对象，read的是网络报文
+         * @param ctx
+         */
         @Override
         public void read(ChannelHandlerContext ctx) {
             unsafe.beginRead();

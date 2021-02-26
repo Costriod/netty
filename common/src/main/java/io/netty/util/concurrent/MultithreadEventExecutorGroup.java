@@ -34,6 +34,9 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
     private final Set<EventExecutor> readonlyChildren;
     private final AtomicInteger terminatedChildren = new AtomicInteger();
     private final Promise<?> terminationFuture = new DefaultPromise(GlobalEventExecutor.INSTANCE);
+    /**
+     * 用于选择EventExecutor（本质上是EventLoop对象），其实就是轮询算法
+     */
     private final EventExecutorChooserFactory.EventExecutorChooser chooser;
 
     /**
@@ -72,7 +75,9 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
             throw new IllegalArgumentException(String.format("nThreads: %d (expected: > 0)", nThreads));
         }
 
+        //执行到这里的时候，一般executor是null，所以下面默认生成了一个单线程的Executor
         if (executor == null) {
+            //生成一个单线程的Executor，底层是直接创建Thread，然后start()
             executor = new ThreadPerTaskExecutor(newDefaultThreadFactory());
         }
 
@@ -81,6 +86,7 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
         for (int i = 0; i < nThreads; i ++) {
             boolean success = false;
             try {
+                //本质上这里newChild产生的是一个新的 EventLoop对象，例如NioEventLoop
                 children[i] = newChild(executor, args);
                 success = true;
             } catch (Exception e) {
@@ -107,7 +113,7 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
                 }
             }
         }
-
+        //用于选择EventExecutor（本质上是EventLoop对象），其实就是轮询算法
         chooser = chooserFactory.newChooser(children);
 
         final FutureListener<Object> terminationListener = new FutureListener<Object>() {
@@ -120,6 +126,8 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
         };
 
         for (EventExecutor e: children) {
+            //如果terminationFuture处理完毕，则立即通知terminationListener，terminationListener里面就是检查 children 线程是否完全退出；
+            //如果所有children完全退出，则设置terminationFuture为success
             e.terminationFuture().addListener(terminationListener);
         }
 
@@ -132,6 +140,10 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
         return new DefaultThreadFactory(getClass());
     }
 
+    /**
+     * 通过轮询算法，选择一个NioEventLoop
+     * @return
+     */
     @Override
     public EventExecutor next() {
         return chooser.next();
@@ -154,6 +166,7 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
      * Create a new EventExecutor which will later then accessible via the {@link #next()}  method. This method will be
      * called for each thread that will serve this {@link MultithreadEventExecutorGroup}.
      *
+     * 本质上这里newChild产生的是一个新的 EventLoop对象，例如NioEventLoop
      */
     protected abstract EventExecutor newChild(Executor executor, Object... args) throws Exception;
 

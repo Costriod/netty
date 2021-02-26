@@ -15,17 +15,21 @@
  */
 package io.netty.channel.nio;
 
+import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelConfig;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.ServerChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 
 import java.io.IOException;
 import java.net.PortUnreachableException;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -47,6 +51,11 @@ public abstract class AbstractNioMessageChannel extends AbstractNioChannel {
         return new NioMessageUnsafe();
     }
 
+    /**
+     * 其实这个beginRead就是做一件事，就是通过selectionKey.interestOps(ops)给SocketChannel注册感兴趣的事件类型，
+     * 然后让{@link NioEventLoop#run()}方法内部无限循环执行{@link Selector#select()}读取就绪事件，然后处理
+     * @throws Exception
+     */
     @Override
     protected void doBeginRead() throws Exception {
         if (inputShutdown) {
@@ -55,6 +64,15 @@ public abstract class AbstractNioMessageChannel extends AbstractNioChannel {
         super.doBeginRead();
     }
 
+    /**
+     * 用于server端的{@link NioServerSocketChannel}，主要功能是读取client的{@link NioSocketChannel}
+     * 只要client连到server，server就会通过accept获取到这个{@link NioSocketChannel}，然后触发一个channelRead事件
+     *
+     * channelRead事件触发的时候，由于此时{@link NioServerSocketChannel}内部的pipeline只有3个handler，如下：
+     * head -> LoggingHandler -> {@link ServerBootstrap.ServerBootstrapAcceptor} -> tail
+     *
+     * 此时会从head往后挨个执行 handler.channelRead(msg)，就会进入{@link ServerBootstrap.ServerBootstrapAcceptor#channelRead}
+     */
     private final class NioMessageUnsafe extends AbstractNioUnsafe {
 
         private final List<Object> readBuf = new ArrayList<Object>();
@@ -72,6 +90,9 @@ public abstract class AbstractNioMessageChannel extends AbstractNioChannel {
             try {
                 try {
                     do {
+                        /*
+                        注意：{@link NioServerSocketChannel}的doReadMessages方法，该方法读取的不是网络报文，而是一个个{@link NioSocketChannel}；
+                         */
                         int localRead = doReadMessages(readBuf);
                         if (localRead == 0) {
                             break;

@@ -26,6 +26,8 @@ import io.netty.channel.DefaultChannelPromise;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ReflectiveChannelFactory;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GlobalEventExecutor;
@@ -56,6 +58,9 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     @SuppressWarnings("unchecked")
     static final Map.Entry<AttributeKey<?>, Object>[] EMPTY_ATTRIBUTE_ARRAY = new Map.Entry[0];
 
+    /**
+     * 处理tcp channel的连接事件
+     */
     volatile EventLoopGroup group;
     @SuppressWarnings("deprecation")
     private volatile ChannelFactory<? extends C> channelFactory;
@@ -63,8 +68,14 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
 
     // The order in which ChannelOptions are applied is important they may depend on each other for validation
     // purposes.
+    /**
+     * option主要是针对parentGroup线程组，childOptions主要是针对childGroup线程组
+     */
     private final Map<ChannelOption<?>, Object> options = new LinkedHashMap<ChannelOption<?>, Object>();
     private final Map<AttributeKey<?>, Object> attrs = new ConcurrentHashMap<AttributeKey<?>, Object>();
+    /**
+     * handler在初始化时就会执行，而childHandler会在客户端成功connect后才执行，这是两者的区别
+     */
     private volatile ChannelHandler handler;
 
     AbstractBootstrap() {
@@ -83,6 +94,8 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     /**
+     * 指定parentGroup
+     *
      * The {@link EventLoopGroup} which is used to handle all the events for the to-be-created
      * {@link Channel}
      */
@@ -101,6 +114,9 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     /**
+     * 指定channel工厂，例如{@link NioServerSocketChannel} 或 {@link NioSocketChannel}
+     * 通过ReflectiveChannelFactory执行反射创建channel对象
+     *
      * The {@link Class} which is used to create {@link Channel} instances from.
      * You either use this or {@link #channelFactory(io.netty.channel.ChannelFactory)} if your
      * {@link Channel} implementation has no no-args constructor.
@@ -167,6 +183,8 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     /**
+     * option主要是针对parentGroup线程组，childOptions主要是针对childGroup线程组
+     *
      * Allow to specify a {@link ChannelOption} which is used for the {@link Channel} instances once they got
      * created. Use a value of {@code null} to remove a previous set {@link ChannelOption}.
      */
@@ -197,6 +215,8 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     /**
+     * 检查各个属性是否配置完毕
+     *
      * Validate all the parameters. Sub-classes may override this, but should
      * call the super method in that case.
      */
@@ -268,13 +288,21 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         return doBind(ObjectUtil.checkNotNull(localAddress, "localAddress"));
     }
 
+    /**
+     * server启动的时候，不管执行哪一种bind方法，最终都是进入这里
+     *
+     * @param localAddress
+     * @return
+     */
     private ChannelFuture doBind(final SocketAddress localAddress) {
+        //初始化NioServerSocketChannel，然后将ServerSocketChannel注册到selector里面
         final ChannelFuture regFuture = initAndRegister();
         final Channel channel = regFuture.channel();
         if (regFuture.cause() != null) {
             return regFuture;
         }
 
+        //详情参考{@link AbstractChannel.AbstractUnsafe.register0(promise)}
         if (regFuture.isDone()) {
             // At this point we know that the registration was complete and successful.
             ChannelPromise promise = channel.newPromise();
@@ -304,10 +332,16 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         }
     }
 
+    /**
+     * 初始化NioServerSocketChannel（初始化完毕之后还未建立端口监听）
+     * @return
+     */
     final ChannelFuture initAndRegister() {
         Channel channel = null;
         try {
+            //通过工厂模式创建ServerSocketChannel，这里是反射方式创建
             channel = channelFactory.newChannel();
+            //初始化ServerSocketChannel，由ServerBootstrap初始化
             init(channel);
         } catch (Throwable t) {
             if (channel != null) {
@@ -320,7 +354,13 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
             return new DefaultChannelPromise(new FailedChannel(), GlobalEventExecutor.INSTANCE).setFailure(t);
         }
 
+        /*
+        这一步执行java ServerSocketChannel的register操作，其实就是将ServerSocketChannel与Selector进行一个绑定
+        通过parentGroup执行register操作，这是一个很复杂的操作，执行完这一步之后，server就开始建立一个端口进行监听，等待client的tcp连接
+        config().group().register(channel)，本质上执行的是MultithreadEventLoopGroup.register(channel)
+        */
         ChannelFuture regFuture = config().group().register(channel);
+        //regFuture是一个DefaultChannelPromise
         if (regFuture.cause() != null) {
             if (channel.isRegistered()) {
                 channel.close();
@@ -343,6 +383,14 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
 
     abstract void init(Channel channel) throws Exception;
 
+    /**
+     * 这里就是server端真正建立端口监听网络io的地方
+     *
+     * @param regFuture
+     * @param channel
+     * @param localAddress
+     * @param promise
+     */
     private static void doBind0(
             final ChannelFuture regFuture, final Channel channel,
             final SocketAddress localAddress, final ChannelPromise promise) {
@@ -353,6 +401,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
             @Override
             public void run() {
                 if (regFuture.isSuccess()) {
+                    //channel是NioServerSocketChannel，bind方法最终会走到{@link AbstractChannel.bind(socketAddress, promise)}
                     channel.bind(localAddress, promise).addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
                 } else {
                     promise.setFailure(regFuture.cause());
@@ -362,6 +411,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     /**
+     *
      * the {@link ChannelHandler} to use for serving the requests.
      */
     public B handler(ChannelHandler handler) {

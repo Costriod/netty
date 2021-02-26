@@ -73,6 +73,10 @@ public abstract class MultithreadEventLoopGroup extends MultithreadEventExecutor
         return new DefaultThreadFactory(getClass(), Thread.MAX_PRIORITY);
     }
 
+    /**
+     * 本质上调用{@link MultithreadEventExecutorGroup#next()}，通过轮询算法，选择一个NioEventLoop
+     * @return
+     */
     @Override
     public EventLoop next() {
         return (EventLoop) super.next();
@@ -81,6 +85,14 @@ public abstract class MultithreadEventLoopGroup extends MultithreadEventExecutor
     @Override
     protected abstract EventLoop newChild(Executor executor, Object... args) throws Exception;
 
+    /**
+     * 如果Channel是NioServerSocketChannel，则代表是Server端进行register操作，通过轮询算法，选择一个NioEventLoop，
+     * 然后执行NioEventLoop的register操作，这个register在NioEventLoop的父类SingleThreadEventLoop里面，详情参考：
+     * {@link SingleThreadEventLoop#register(io.netty.channel.Channel)}
+     *
+     * @param channel
+     * @return
+     */
     @Override
     public ChannelFuture register(Channel channel) {
         return next().register(channel);

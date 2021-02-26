@@ -66,10 +66,13 @@ public class NioServerSocketChannel extends AbstractNioMessageChannel
         }
     }
 
+    /**
+     * 一般是{@link NioServerSocketChannelConfig}
+     */
     private final ServerSocketChannelConfig config;
 
     /**
-     * Create a new instance
+     * 默认构造函数创建NioServerSocketChannel
      */
     public NioServerSocketChannel() {
         this(newSocket(DEFAULT_SELECTOR_PROVIDER));
@@ -83,6 +86,7 @@ public class NioServerSocketChannel extends AbstractNioMessageChannel
     }
 
     /**
+     * 通过NIO的selector模式，监听OP_ACCEPT事件，OP_ACCEPT表示有一个客户端向服务器端发起了连接请求
      * Create a new instance using the given {@link ServerSocketChannel}.
      */
     public NioServerSocketChannel(ServerSocketChannel channel) {
